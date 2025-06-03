@@ -1,71 +1,58 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Security.Cryptography;
 using Tekla.Structures;
 using Tekla.Structures.Model;
 using Tekla.Structures.Model.UI;
 
 namespace BoltPhaseChecker
 {
-    public class BoltOrderIssue
+    // === MODELE BŁĘDÓW ===
+
+    public abstract class IssueBase
     {
-        public int BoltId { get; set; }
-        public int BoltPhase { get; set; } 
+        public int PartId { get; set; }
+        public bool NeedsFix { get; set; }
+    }
+
+    public class BoltOrderIssue : IssueBase
+    {
+        public int BoltPhase { get; set; }
         public int PhaseTo { get; set; }
         public int PhaseWith { get; set; }
-        public bool NeedsFix { get; set; }
 
-        public int PartId { get; set; }
-        public int PartPhase { get; set; } 
+        public int BoltId => PartId;
+    }
+
+    public class PartPhaseIssue : IssueBase
+    {
+        public int PartPhase { get; set; }
         public int AssemblyPhase { get; set; }
-        public bool PartNeedsFix { get; set; }
+    }
 
-
+    public class StartNumberIssue : IssueBase
+    {
         public int Phase { get; set; }
         public int StartNumber { get; set; }
-
-        public int Expected { get; set; }
-        public int Found { get; set; }
-
-
-
-
-        public BoltOrderIssue(int id, int boltPhase, int phaseTo, int phaseWith, bool needsFix)
-        {
-
-            BoltId = id;
-            BoltPhase = boltPhase;
-            PhaseTo = phaseTo;
-            PhaseWith = phaseWith;
-            NeedsFix = needsFix;
-
-            PartId = id;
-            PartPhase = boltPhase;
-            AssemblyPhase = phaseTo;
-            PartNeedsFix = needsFix;
-
-            PartId = id;
-            Phase = boltPhase;
-            StartNumber = phaseTo;
-            NeedsFix = needsFix;
-
-
-
-        }
-
-
-
+        public int ExpectedStartNumber { get; set; }
     }
+
+    public class PrelimIssue
+    {
+        public int PartId { get; set; }
+        public string Profile { get; set; }
+        public string PrelimMark { get; set; }
+        public bool NeedsFix { get; set; }
+    }
+
+
+
+
+    // === LOGIKA ===
 
     public class BoltPhaseCheckerLogic
     {
-        private readonly Model _model;
+        private readonly Model _model = new Model();
 
-        public BoltPhaseCheckerLogic()
-        {
-            _model = new Model();
-        }
         public bool CheckModelConnection(out string message)
         {
             if (_model.GetConnectionStatus())
@@ -79,16 +66,22 @@ namespace BoltPhaseChecker
                 return false;
             }
         }
+
         public Part GetPartById(int id)
         {
-            var selObj = _model.SelectModelObject(new Identifier(id));
-            return selObj as Part;
+            return _model.SelectModelObject(new Identifier(id)) as Part;
         }
-        public List<BoltOrderIssue> GetPartOrderIssues()
+
+        public BoltGroup GetBoltById(int id)
+        {
+            return _model.SelectModelObject(new Identifier(id)) as BoltGroup;
+        }
+
+        public List<PartPhaseIssue> GetPartOrderIssues()
         {
             var selector = new Tekla.Structures.Model.UI.ModelObjectSelector();
             var partsEnum = selector.GetSelectedObjects();
-            var list = new List<BoltOrderIssue>();
+            var list = new List<PartPhaseIssue>();
 
             while (partsEnum.MoveNext())
             {
@@ -96,26 +89,26 @@ namespace BoltPhaseChecker
                 if (!part.GetPhase(out Phase partPhase)) continue;
 
                 var asm = part.GetAssembly() as Assembly;
-                if (asm == null) continue;
-                if (!asm.GetPhase(out Phase asmPhase)) continue;
+                if (asm == null || !asm.GetPhase(out Phase asmPhase)) continue;
 
                 bool needsFix = partPhase.PhaseNumber != asmPhase.PhaseNumber;
 
-                list.Add(new BoltOrderIssue(
-                    id: part.Identifier.ID,
-                    boltPhase: partPhase.PhaseNumber,
-                    phaseTo: asmPhase.PhaseNumber,
-                    phaseWith: 0,           // unused for parts
-                    needsFix: needsFix
-                ));
+                list.Add(new PartPhaseIssue
+                {
+                    PartId = part.Identifier.ID,
+                    PartPhase = partPhase.PhaseNumber,
+                    AssemblyPhase = asmPhase.PhaseNumber,
+                    NeedsFix = needsFix
+                });
             }
 
             return list;
         }
+
         public bool FixPartPhase(int partId, out string message)
         {
-            var selObj = _model.SelectModelObject(new Identifier(partId));
-            if (!(selObj is Part part))
+            var part = GetPartById(partId);
+            if (part == null)
             {
                 message = "Could not retrieve Part.";
                 return false;
@@ -127,14 +120,8 @@ namespace BoltPhaseChecker
                 return false;
             }
 
-            var asmObj = part.GetAssembly();
-            if (!(asmObj is Assembly asm))
-            {
-                message = "Part not in an assembly.";
-                return false;
-            }
-
-            if (!asm.GetPhase(out Phase asmPhase))
+            var asm = part.GetAssembly() as Assembly;
+            if (asm == null || !asm.GetPhase(out Phase asmPhase))
             {
                 message = "Could not read assembly phase.";
                 return false;
@@ -151,37 +138,39 @@ namespace BoltPhaseChecker
             return true;
         }
 
-        public List<BoltOrderIssue> GetStartNumberIssues()
+        public List<StartNumberIssue> GetStartNumberIssues()
         {
             var selector = new Tekla.Structures.Model.UI.ModelObjectSelector();
             var partsEnum = selector.GetSelectedObjects();
-            var list = new List<BoltOrderIssue>();
+            var list = new List<StartNumberIssue>();
 
             while (partsEnum.MoveNext())
             {
                 if (!(partsEnum.Current is Part part)) continue;
                 if (!part.GetPhase(out Phase phase)) continue;
 
-                int expectedStartNumber = phase.PhaseNumber * 1000 + 1;
-                int actualStartNumber = part.PartNumber.StartNumber;
+                int expected = phase.PhaseNumber * 1000 + 1;
+                int found = part.PartNumber.StartNumber;
 
-                bool needsFix = actualStartNumber != expectedStartNumber;
+                bool needsFix = found != expected;
 
-                list.Add(new BoltOrderIssue(
-                    id: part.Identifier.ID,
-                    boltPhase: actualStartNumber,      // przechowuje tu aktualny StartNumber
-                    phaseTo: expectedStartNumber,      // oczekiwany StartNumber
-                    phaseWith: phase.PhaseNumber,      // faza
-                    needsFix: needsFix
-                ));
+                list.Add(new StartNumberIssue
+                {
+                    PartId = part.Identifier.ID,
+                    Phase = phase.PhaseNumber,
+                    StartNumber = found,
+                    ExpectedStartNumber = expected,
+                    NeedsFix = needsFix
+                });
             }
 
             return list;
         }
+
         public bool FixStartNumber(int partId, out string message)
         {
-            var selObj = _model.SelectModelObject(new Identifier(partId));
-            if (!(selObj is Part part))
+            var part = GetPartById(partId);
+            if (part == null)
             {
                 message = "Could not retrieve Part.";
                 return false;
@@ -206,8 +195,6 @@ namespace BoltPhaseChecker
             return true;
         }
 
-
-        // --- Bolting order/phase logic ---
         public List<BoltOrderIssue> GetBoltOrderIssues(Dictionary<int, int> seqIdx)
         {
             var sel = new Tekla.Structures.Model.UI.ModelObjectSelector();
@@ -227,33 +214,23 @@ namespace BoltPhaseChecker
                 bool orderOK = inSeq && seqIdx[toPh] < seqIdx[withPh];
                 bool phasesEqual = (toPh == withPh) && (boltPh == withPh);
 
-                bool needsFix;
+                bool needsFix = !phasesEqual && (!orderOK || (orderOK && boltPh != withPh));
 
-                if (phasesEqual)
+                list.Add(new BoltOrderIssue
                 {
-                    // Everything is correct, do not flag
-                    needsFix = false;
-                }
-                else
-                {
-                    // Old logic: flag if order wrong, or order ok but phase not matching
-                    needsFix = (!orderOK) || (orderOK && boltPh != withPh);
-                }
-
-                list.Add(new BoltOrderIssue(id, boltPh, toPh, withPh, needsFix));
+                    PartId = id,
+                    BoltPhase = boltPh,
+                    PhaseTo = toPh,
+                    PhaseWith = withPh,
+                    NeedsFix = needsFix
+                });
             }
             return list;
         }
 
-
-        public BoltGroup GetBoltById(int id)
-        {
-            return _model.SelectModelObject(new Identifier(id)) as BoltGroup;
-        }
-
         public bool SwapBoltParts(int boltId, Dictionary<int, int> seqIdx)
         {
-            var bolt = _model.SelectModelObject(new Identifier(boltId)) as BoltGroup;
+            var bolt = GetBoltById(boltId);
             if (bolt == null) return false;
 
             var a = bolt.PartToBoltTo;
@@ -264,27 +241,24 @@ namespace BoltPhaseChecker
             int phB = GetPhase(b);
             int boltPh = GetPhase(bolt);
 
-            bool orderOK = seqIdx.ContainsKey(phA) && seqIdx.ContainsKey(phB) && seqIdx[phA] < seqIdx[phB];
-            bool phaseOK = (boltPh == phB);
+            if (!seqIdx.ContainsKey(phA) || !seqIdx.ContainsKey(phB)) return false;
+
+            bool orderOK = seqIdx[phA] < seqIdx[phB];
+            bool phaseOK = boltPh == phB;
 
             if (!orderOK)
             {
-                // Swap and set phase to the later phase
                 bolt.PartToBoltTo = b;
                 bolt.PartToBeBolted = a;
 
-                int laterPhase = seqIdx[phA] > seqIdx[phB] ? phA : phB;
-                bolt.SetPhase(new Phase { PhaseNumber = laterPhase });
+                int later = seqIdx[phA] > seqIdx[phB] ? phA : phB;
+                bolt.SetPhase(new Phase { PhaseNumber = later });
             }
             else if (!phaseOK)
             {
-                // Set bolt phase to "withPh"
                 bolt.SetPhase(new Phase { PhaseNumber = phB });
             }
-            else
-            {
-                return true; // Nothing to do
-            }
+            else return true;
 
             return bolt.Modify();
         }
@@ -293,9 +267,55 @@ namespace BoltPhaseChecker
         {
             return o != null && o.GetPhase(out Phase p) ? p.PhaseNumber : -1;
         }
+
         private int GetPhase(BoltGroup b)
         {
             return b != null && b.GetPhase(out Phase p) ? p.PhaseNumber : -1;
         }
+
+        public List<PrelimIssue> GetPrelimIssues()
+        {
+            var selector = new Tekla.Structures.Model.UI.ModelObjectSelector();
+            var partsEnum = selector.GetSelectedObjects();
+            var list = new List<PrelimIssue>();
+
+            while (partsEnum.MoveNext())
+            {
+                if (!(partsEnum.Current is Part part)) continue;
+
+                string profile = string.Empty;
+                part.GetReportProperty("PROFILE", ref profile);
+
+                // Sprawdź, czy to profilowana stal (dopasuj swoją funkcję)
+                if (!IsColdFormedProfile(profile)) continue;
+
+                string prelimMark = string.Empty;
+                part.GetUserProperty("PRELIM_MARK", ref prelimMark);
+
+                bool needsFix = string.IsNullOrWhiteSpace(prelimMark);
+
+                list.Add(new PrelimIssue
+                {
+                    PartId = part.Identifier.ID,
+                    Profile = profile,
+                    PrelimMark = prelimMark,
+                    NeedsFix = needsFix
+                });
+            }
+
+            return list;
+        }
+
+        private bool IsColdFormedProfile(string profile)
+        {
+            if (string.IsNullOrWhiteSpace(profile)) return false;
+
+            profile = profile.ToUpperInvariant();
+
+            return profile.StartsWith("C") || profile.StartsWith("Z") ||
+                   profile.StartsWith("HAT") || profile.Contains("CFS");
+        }
+
+
     }
 }

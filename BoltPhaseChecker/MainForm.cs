@@ -20,6 +20,10 @@ namespace BoltPhaseChecker
         private Dictionary<int, int> _seqIndex = new Dictionary<int, int>();
         private readonly OpenFileDialog _ofdCsv = new OpenFileDialog() { Filter = "CSV|*.csv" };
         private List<int> _boltOrderErrorIds = new List<int>();
+        private enum CheckMode { None, Bolt, Part }
+        private CheckMode _currentMode = CheckMode.None;
+        List<int> _prelimErrorIds;
+
 
         public MainForm()
         {
@@ -80,7 +84,12 @@ namespace BoltPhaseChecker
                         if (int.TryParse(t, out int ph))
                             _buildSequence.Add(ph);
                 }
-                _buildSequence = _buildSequence.Distinct().OrderBy(x => x).ToList();
+                
+                _buildSequence = _buildSequence
+                .Where(x => x >= 0)
+                .Distinct()
+                .ToList(); // usuwa duplikaty, ale zachowuje kolejność wystąpienia
+                
                 _seqIndex = _buildSequence
                     .Select((phase, idx) => new { phase, idx })
                     .ToDictionary(x => x.phase, x => x.idx);
@@ -93,10 +102,9 @@ namespace BoltPhaseChecker
             }
         }
 
-        private enum CheckMode { None, Bolt, Part }
-        private CheckMode _currentMode = CheckMode.None;
 
-        // --- Part phase checking ---
+
+        // --- Part phase checking & fixing ---
         private void CheckPartPhases()
         {
             Log("Checking selected parts against assembly phases...");
@@ -106,7 +114,7 @@ namespace BoltPhaseChecker
 
             foreach (var issue in issues)
             {
-                bool needsFix = issue.PartNeedsFix;
+                bool needsFix = issue.NeedsFix;
                 string err = needsFix
                     ? $"Part Phase: {issue.PartPhase}, Assembly Phase: {issue.AssemblyPhase}"
                     : string.Empty;
@@ -119,7 +127,7 @@ namespace BoltPhaseChecker
             }
 
             _invalidPartIds = issues
-                .Where(x => x.PartNeedsFix)
+                .Where(x => x.NeedsFix)
                 .Select(x => x.PartId)
                 .ToList();
 
@@ -146,7 +154,7 @@ namespace BoltPhaseChecker
             Log("Finished updating part phases.");
         }
 
-
+        // --- Part start numbers checking & fixing ---
         private void CheckStartNumbers()
         {
             Log("Checking part start numbers...");
@@ -159,11 +167,11 @@ namespace BoltPhaseChecker
                 bool needsFix = issue.NeedsFix;
 
                 string err = needsFix
-                    ? $"Phase: {issue.PhaseWith}, Actual Start: {issue.BoltPhase}, Expected Start: {issue.PhaseTo}"
+                    ? $"Phase: {issue.Phase}, Actual Start: {issue.StartNumber}, Expected Start: {issue.ExpectedStartNumber}"
                     : string.Empty;
 
                 string fix = needsFix
-                    ? $"Set start number to {issue.PhaseTo}"
+                    ? $"Set start number to {issue.ExpectedStartNumber}"
                     : string.Empty;
 
                 grdOrder.Rows.Add(needsFix, issue.PartId, err, fix);
@@ -197,32 +205,17 @@ namespace BoltPhaseChecker
             Log("Done fixing start numbers.");
         }
 
-        private void HighlightWrongParts()
-        {
-            if (_invalidPartIds == null || _invalidPartIds.Count == 0) return;
-            var selector = new Tekla.Structures.Model.UI.ModelObjectSelector();
-            var list = new ArrayList();
-            foreach (int id in _invalidPartIds)
-            {
-                var part = _logic.GetPartById(id);
-                if (part != null) list.Add(part);
-            }
-            selector.Select(list);
-            Log("Parts highlighted.");
-        }
-
         // --- Bolting order checking & fixing ---
-        private void CheckBoltOrder()
+        private bool CheckBoltOrder()
         {
             if (_seqIndex.Count == 0)
             {
                 Log("⚠ Load a build-sequence CSV first.");
-                return;
+                MessageBox.Show("⚠ Load a build-sequence CSV first.");
+                return false;  
             }
 
             Log("Checking bolting order against build sequence...");
-            
-            
 
             var issues = _logic.GetBoltOrderIssues(_seqIndex);
 
@@ -234,9 +227,37 @@ namespace BoltPhaseChecker
                     ? $"Bolt phase: {issue.BoltPhase}, Main Part phase: {issue.PhaseTo},  Secondary part phase: {issue.PhaseWith}"
                     : string.Empty;
 
-                string fix = needsFix
-                    ? $"Set bolt phase to {issue.PhaseWith}"
-                    : string.Empty;
+                string fix = string.Empty;
+
+                if (!needsFix)
+                {
+                    fix = "";
+                }
+                else
+                {
+                    bool toHasIndex = _seqIndex.ContainsKey(issue.PhaseTo);
+                    bool withHasIndex = _seqIndex.ContainsKey(issue.PhaseWith);
+
+                    if (!toHasIndex || !withHasIndex)
+                    {
+                        fix = "⚠ Phase not in CSV — cannot determine order, check part phases.";
+                    }
+                    else
+                    {
+                        int idxTo = _seqIndex[issue.PhaseTo];
+                        int idxWith = _seqIndex[issue.PhaseWith];
+
+                        bool orderCorrect = idxTo < idxWith;
+                        bool phaseMatches = issue.BoltPhase == issue.PhaseWith;
+
+                        if (!orderCorrect && !phaseMatches)
+                            fix = "Swap bolt order and set bolt phase";
+                        else if (!orderCorrect)
+                            fix = "Swap bolt order";
+                        else if (!phaseMatches)
+                            fix = $"Set bolt phase to {issue.PhaseWith}";
+                    }
+                }
 
                 grdOrder.Rows.Add(needsFix, issue.BoltId, err, fix);
             }
@@ -248,7 +269,10 @@ namespace BoltPhaseChecker
 
             Log($"{_orderBoltIds.Count} bolt groups need fixing (pre-ticked).");
             _currentMode = CheckMode.Bolt;
+
+            return true; // <- operacja zakończona poprawnie
         }
+
 
         private void FixBoltOrder()
         {
@@ -259,19 +283,62 @@ namespace BoltPhaseChecker
             }
 
             int fixedCount = 0;
+
             foreach (DataGridViewRow row in grdOrder.Rows)
             {
                 if (row.Cells[0].Value is bool chk && chk)
                 {
                     int id = Convert.ToInt32(row.Cells[1].Value);
-                    if (_logic.SwapBoltParts(id, _seqIndex))
-                        fixedCount++;
+
+                    // Sprawdzenie, czy to ID jest na liście śrub do poprawy
+                    if (_orderBoltIds.Contains(id))
+                    {
+                        if (_logic.SwapBoltParts(id, _seqIndex))
+                            fixedCount++;
+                    }
                 }
             }
+
             Log($"Bolting order fixed on {fixedCount} bolt groups.");
         }
 
-        // --- Highlight Selected Bolts ---
+        // --- Check prelims ---
+
+
+
+        private void CheckPrelims()
+        {
+            Log("Checking PRELIM assignments...");
+
+            var issues = _logic.GetPrelimIssues();
+
+            foreach (var issue in issues)
+            {
+                string err = issue.NeedsFix
+                    ? $"Profile: {issue.Profile}, PRELIM: <empty>"
+                    : string.Empty;
+
+                string fix = issue.NeedsFix
+                    ? "Set PRELIM = YES"
+                    : string.Empty;
+
+                grdOrder.Rows.Add(issue.NeedsFix, issue.PartId, err, fix);
+            }
+
+            _prelimErrorIds = issues
+                .Where(i => i.NeedsFix)
+                .Select(i => i.PartId)
+                .ToList();
+
+            Log($"Found {_prelimErrorIds.Count} parts missing PRELIM assignment.");
+            _currentMode = CheckMode.Part;
+        }
+
+
+
+
+
+        // --- Highlight Selected Bolts and parts ---
         private void btnHighlightSelected_Click(object sender, EventArgs e)
         {
             var selector = new Tekla.Structures.Model.UI.ModelObjectSelector();
@@ -309,21 +376,27 @@ namespace BoltPhaseChecker
             selector.Select(list);
             Log($"{list.Count} model objects highlighted.");
         }
-
+        // --- Functions for buttons ---
         private void btnUnifiedCheck_Click(object sender, EventArgs e)
         {
             grdOrder.Rows.Clear();
             SetupUnifiedGrid();
-            if (chkBoltOrder.Checked) CheckBoltOrder();
+
+
             if (chkPartPhases.Checked) CheckPartPhases();
             if (chkStartNumbers.Checked) CheckStartNumbers();
+            // Jeśli checkbox od bolta jest zaznaczony, ale nie wczytano sekwencji — nie kontynuujemy
+            if (chkBoltOrder.Checked && !CheckBoltOrder())
+                return;
+
         }
 
         private void btnUnifiedFix_Click(object sender, EventArgs e)
         {
-            if (chkBoltOrder.Checked) FixBoltOrder();
             if (chkPartPhases.Checked) FixPartPhases();
             if (chkStartNumbers.Checked) FixStartNumbers();
+            if (chkBoltOrder.Checked) FixBoltOrder();
+
         }
 
 
